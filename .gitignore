@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+*.log
+logs/
+*.sqlite3
+*.db
+.DS_Store
+Thumbs.db
+historico_exportacoes/
