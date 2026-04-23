@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
@@ -8,11 +7,18 @@ import io
 import re
 import zipfile
 from pathlib import Path
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from historico_db import init_db, save_run, list_runs, get_run, excluir_run
+from vencimentos_utils import (
+    carregar_dados_vencimentos,
+    comparar_bases,
+    extrair_ano_vencimento,
+    formatar_cpf_cnpj_brasileiro,
+    gerar_excel_vencimentos_formatado,
+    remover_duplicados_manter_mais_antiga,
+)
 
-# Configuração da página
+# Configuração básica da página.
 st.set_page_config(
     page_title="Acompanhamento: Comparação de Bases por Ano de Vencimento",
     page_icon="📅",
@@ -20,7 +26,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS personalizado
+# Estilo visual do app.
 st.markdown("""
 <style>
     .main-header {
@@ -60,11 +66,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Título principal
+# Cabeçalho principal.
 st.markdown('<div class="main-header">📅 Acompanhamento: Comparação de Bases por Ano de Vencimento</div>', unsafe_allow_html=True)
 st.markdown('<p style="text-align: center; color: #666; font-size: 1.1rem;">Compare duas bases e veja quantos autos saíram ou entraram por ano de vencimento</p>', unsafe_allow_html=True)
 
-# Sidebar
+# Barra lateral com uploads e nomes de colunas.
 with st.sidebar:
     st.image("https://via.placeholder.com/200x80/1f4e79/ffffff?text=ANTT", use_container_width=True)
     st.markdown("### 📁 Upload das Bases")
@@ -87,14 +93,14 @@ with st.sidebar:
     st.markdown("### ⚙️ Configurações")
     
     st.markdown("#### 🔑 Colunas Obrigatórias")
-    # Campo para identificar Auto de Infração
+    # Esse campo precisa bater com o nome real da coluna nas duas bases.
     coluna_auto = st.text_input(
         "Nome da coluna Auto de Infração",
         value="Identificador do Débito",
         help="⚠️ OBRIGATÓRIO: Digite o nome exato da coluna que contém os Autos de Infração"
     )
     
-    # Campo para identificar data de vencimento
+    # A comparação depende da coluna de vencimento estar correta.
     coluna_vencimento = st.text_input(
         "Nome da coluna Vencimento",
         value="Data do Vencimento",
@@ -103,326 +109,38 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("#### 📋 Colunas Opcionais")
-    # Campo para identificar número de protocolos (opcional)
+    # Protocolo é opcional, mas ajuda nas exportações.
     coluna_protocolo = st.text_input(
         "Nome da coluna Nº do Processo (Opcional)",
         value="Nº do Processo",
         help="Digite o nome exato da coluna que contém os números de protocolos (opcional)"
     )
     
-    # Campo para identificar Subtipo de Débito (Modal) (opcional)
+    # Modal entra como informação complementar.
     coluna_modal = st.text_input(
         "Nome da coluna Subtipo de Débito (Opcional)",
         value="Subtipo de Débito",
         help="Digite o nome exato da coluna que contém os modais (opcional)"
     )
     
-    # Campo para identificar CPF/CNPJ (opcional)
+    # CPF/CNPJ é opcional e aparece quando a base trouxer esse dado.
     coluna_cpf_cnpj = st.text_input(
         "Nome da coluna CPF/CNPJ (Opcional)",
         value="CPF/CNPJ",
         help="Digite o nome exato da coluna que contém CPF/CNPJ (opcional)"
     )
 
-# Função para carregar dados
-@st.cache_data
-def carregar_dados(arquivo):
-    try:
-        if arquivo.name.endswith('.csv'):
-            df = pd.read_csv(arquivo, encoding='utf-8', sep=';', decimal=',', header=0)
-        else:
-            df = pd.read_excel(arquivo, header=0)
-        
-        # Remover linhas completamente vazias
-        df = df.dropna(how='all')
-        
-        return df
-    except Exception as e:
-        st.error(f"Erro ao carregar arquivo: {str(e)}")
-        return None
+# A parte de leitura, comparação e exportação ficou em `vencimentos_utils.py`.
 
-# Função para remover duplicados mantendo data mais antiga
-def remover_duplicados_manter_mais_antiga(df, coluna_auto, coluna_vencimento):
-    """Remove duplicados baseado em Auto de Infração, mantendo a data de vencimento mais antiga"""
-    df_resultado = df.copy()
-    
-    # Converter data de vencimento para datetime
-    try:
-        if df_resultado[coluna_vencimento].dtype != 'datetime64[ns]':
-            df_resultado['_VENCIMENTO_DT'] = pd.to_datetime(
-                df_resultado[coluna_vencimento],
-                errors='coerce',
-                dayfirst=True,
-                infer_datetime_format=True
-            )
-        else:
-            df_resultado['_VENCIMENTO_DT'] = df_resultado[coluna_vencimento]
-        
-        # Ordenar por Auto de Infração e depois por data (mais antiga primeiro)
-        df_resultado = df_resultado.sort_values(
-            by=[coluna_auto, '_VENCIMENTO_DT'],
-            ascending=[True, True],  # Mais antiga primeiro
-            na_position='last'
-        )
-        
-        # Remover duplicados mantendo a primeira ocorrência (que será a mais antiga)
-        df_resultado = df_resultado.drop_duplicates(
-            subset=[coluna_auto],
-            keep='first'
-        ).copy()
-        
-        # Remover coluna auxiliar
-        if '_VENCIMENTO_DT' in df_resultado.columns:
-            df_resultado = df_resultado.drop(columns=['_VENCIMENTO_DT'])
-        
-        return df_resultado
-    except Exception as e:
-        st.error(f"Erro ao remover duplicados: {str(e)}")
-        return df
-
-# Função para extrair ano da data de vencimento
-def extrair_ano_vencimento(df, coluna_vencimento):
-    """Extrai o ano da coluna de vencimento"""
-    df_resultado = df.copy()
-    
-    # Converter para datetime
-    try:
-        if df_resultado[coluna_vencimento].dtype != 'datetime64[ns]':
-            df_resultado['_VENCIMENTO_DT'] = pd.to_datetime(
-                df_resultado[coluna_vencimento],
-                errors='coerce',
-                dayfirst=True,
-                infer_datetime_format=True
-            )
-        else:
-            df_resultado['_VENCIMENTO_DT'] = df_resultado[coluna_vencimento]
-        
-        # Extrair ano
-        df_resultado['ANO_VENCIMENTO'] = df_resultado['_VENCIMENTO_DT'].dt.year
-        
-        # Remover coluna auxiliar
-        if '_VENCIMENTO_DT' in df_resultado.columns:
-            df_resultado = df_resultado.drop(columns=['_VENCIMENTO_DT'])
-        
-        return df_resultado
-    except Exception as e:
-        st.error(f"Erro ao extrair ano: {str(e)}")
-        return df
-
-# Função para comparar duas bases e calcular saíram/entraram por ano
-def comparar_bases(df_antiga, df_nova, coluna_auto, coluna_vencimento):
-    """
-    Processa base antiga e nova (remove duplicados, extrai ano).
-    Para cada ano de vencimento: quantidade na antiga, na nova, quantos saíram, quantos entraram.
-    Retorna: comparacao_df, autos_sairam_por_ano, autos_entraram_por_ano, df_antiga_com_ano, df_nova_com_ano,
-             stats_antiga_por_ano, stats_nova_por_ano, anos_todos
-    """
-    # Processar base antiga
-    df_antiga_limpa = remover_duplicados_manter_mais_antiga(df_antiga, coluna_auto, coluna_vencimento)
-    df_antiga_com_ano = extrair_ano_vencimento(df_antiga_limpa, coluna_vencimento)
-    df_antiga_com_ano = df_antiga_com_ano[df_antiga_com_ano['ANO_VENCIMENTO'].notna()].copy()
-    df_antiga_com_ano['ANO_VENCIMENTO'] = df_antiga_com_ano['ANO_VENCIMENTO'].astype(int)
-
-    # Processar base nova
-    df_nova_limpa = remover_duplicados_manter_mais_antiga(df_nova, coluna_auto, coluna_vencimento)
-    df_nova_com_ano = extrair_ano_vencimento(df_nova_limpa, coluna_vencimento)
-    df_nova_com_ano = df_nova_com_ano[df_nova_com_ano['ANO_VENCIMENTO'].notna()].copy()
-    df_nova_com_ano['ANO_VENCIMENTO'] = df_nova_com_ano['ANO_VENCIMENTO'].astype(int)
-
-    # Conjuntos de autos por ano (identificador normalizado como string)
-    def autos_por_ano(df_com_ano):
-        d = {}
-        for ano, g in df_com_ano.groupby('ANO_VENCIMENTO'):
-            d[int(ano)] = set(g[coluna_auto].astype(str).str.strip().values)
-        return d
-
-    antiga_por_ano = autos_por_ano(df_antiga_com_ano)
-    nova_por_ano = autos_por_ano(df_nova_com_ano)
-    anos_todos = sorted(set(antiga_por_ano.keys()) | set(nova_por_ano.keys()))
-
-    # Estatísticas por ano para cada base (para exportação/visualização)
-    stats_antiga_por_ano = {}
-    for ano in anos_todos:
-        df_ano = df_antiga_com_ano[df_antiga_com_ano['ANO_VENCIMENTO'] == ano]
-        stats_antiga_por_ano[ano] = {'quantidade': len(df_ano), 'dataframe': df_ano}
-    stats_nova_por_ano = {}
-    for ano in anos_todos:
-        df_ano = df_nova_com_ano[df_nova_com_ano['ANO_VENCIMENTO'] == ano]
-        stats_nova_por_ano[ano] = {'quantidade': len(df_ano), 'dataframe': df_ano}
-
-    # Comparação: saíram = estavam na antiga naquele ano e não estão na nova; entraram = estão na nova e não estavam na antiga
-    linhas = []
-    autos_sairam_por_ano = {}
-    autos_entraram_por_ano = {}
-    for ano in anos_todos:
-        set_antiga = antiga_por_ano.get(ano, set())
-        set_nova = nova_por_ano.get(ano, set())
-        sairam = set_antiga - set_nova
-        entraram = set_nova - set_antiga
-        autos_sairam_por_ano[ano] = sairam
-        autos_entraram_por_ano[ano] = entraram
-        linhas.append({
-            'Ano': ano,
-            'Qtd base antiga': len(set_antiga),
-            'Qtd base nova': len(set_nova),
-            'Sairam': len(sairam),
-            'Entraram': len(entraram),
-        })
-    comparacao_df = pd.DataFrame(linhas)
-
-    return {
-        'comparacao_df': comparacao_df,
-        'autos_sairam_por_ano': autos_sairam_por_ano,
-        'autos_entraram_por_ano': autos_entraram_por_ano,
-        'df_antiga_com_ano': df_antiga_com_ano,
-        'df_nova_com_ano': df_nova_com_ano,
-        'stats_antiga_por_ano': stats_antiga_por_ano,
-        'stats_nova_por_ano': stats_nova_por_ano,
-        'anos_todos': anos_todos,
-        'duplicados_antiga': len(df_antiga) - len(df_antiga_limpa),
-        'duplicados_nova': len(df_nova) - len(df_nova_limpa),
-    }
-
-# Função para formatar CPF/CNPJ no formato brasileiro
-def formatar_cpf_cnpj_brasileiro(valor):
-    """Formata CPF/CNPJ no formato brasileiro"""
-    if pd.isna(valor) or valor == '' or valor is None:
-        return ''
-    
-    # Remove caracteres não numéricos
-    valor_str = str(valor).replace('.', '').replace('-', '').replace('/', '').strip()
-    
-    # Se estiver vazio, retorna vazio
-    if not valor_str or not valor_str.isdigit():
-        return str(valor)
-    
-    # Formatar CPF (11 dígitos)
-    if len(valor_str) == 11:
-        return f"{valor_str[0:3]}.{valor_str[3:6]}.{valor_str[6:9]}-{valor_str[9:11]}"
-    
-    # Formatar CNPJ (14 dígitos)
-    elif len(valor_str) == 14:
-        return f"{valor_str[0:2]}.{valor_str[2:5]}.{valor_str[5:8]}/{valor_str[8:12]}-{valor_str[12:14]}"
-    
-    # Se não tiver 11 ou 14 dígitos, retorna o valor original
-    return str(valor)
-
-# Função para gerar Excel formatado (mesmo estilo do app.py)
-def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
-    """Gera arquivo Excel formatado a partir de um DataFrame"""
-    buffer = io.BytesIO()
-    try:
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            dados_df.to_excel(
-                writer,
-                sheet_name=nome_aba,
-                index=False,
-                header=True
-            )
-            
-            worksheet = writer.sheets[nome_aba]
-            
-            # Aplicar formatação completa
-            num_colunas = len(dados_df.columns)
-            tem_protocolo = 'Nº DE PROCESSO' in dados_df.columns
-            tem_data_venc = 'DATA DE VENCIMENTO' in dados_df.columns
-            tem_cpf = 'CNPJ' in dados_df.columns
-            tem_modal = 'MODAL' in dados_df.columns
-            
-            # Ajustar larguras das colunas
-            col_idx = 0
-            for col in dados_df.columns:
-                col_letter = chr(65 + col_idx)  # A, B, C, etc.
-                if col == 'IDENTIFICADOR DE DÉBITO':
-                    worksheet.column_dimensions[col_letter].width = 25
-                elif col == 'Nº DE PROCESSO':
-                    worksheet.column_dimensions[col_letter].width = 20
-                elif col == 'DATA DE VENCIMENTO':
-                    worksheet.column_dimensions[col_letter].width = 18
-                elif col == 'CNPJ':
-                    worksheet.column_dimensions[col_letter].width = 18
-                elif col == 'MODAL':
-                    worksheet.column_dimensions[col_letter].width = 18
-                else:
-                    worksheet.column_dimensions[col_letter].width = 15
-                col_idx += 1
-            
-            # Formatação do cabeçalho
-            header_fill = PatternFill(start_color="1f4e79", end_color="1f4e79", fill_type="solid")
-            header_font = Font(bold=True, color="FFFFFF", size=11)
-            header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            
-            for cell in worksheet[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = header_alignment
-            
-            # Formatar colunas
-            thin_border = Border(
-                left=Side(style='thin'),
-                right=Side(style='thin'),
-                top=Side(style='thin'),
-                bottom=Side(style='thin')
-            )
-            
-            # Calcular índices das colunas
-            idx_auto = None
-            idx_protocolo = None
-            idx_data_venc = None
-            idx_cpf = None
-            idx_modal = None
-            
-            col_idx = 1
-            for col in dados_df.columns:
-                if col == 'IDENTIFICADOR DE DÉBITO':
-                    idx_auto = col_idx
-                elif col == 'Nº DE PROCESSO':
-                    idx_protocolo = col_idx
-                elif col == 'DATA DE VENCIMENTO':
-                    idx_data_venc = col_idx
-                elif col == 'CNPJ':
-                    idx_cpf = col_idx
-                elif col == 'MODAL':
-                    idx_modal = col_idx
-                col_idx += 1
-            
-            # Aplicar formatação nas células
-            for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=num_colunas):
-                for cell in row:
-                    cell.border = thin_border
-                    if cell.row > 1:  # Não formatar cabeçalho
-                        if idx_cpf and cell.column == idx_cpf:  # CNPJ
-                            cell.number_format = '@'
-                            cell.alignment = Alignment(horizontal="center", vertical="center")
-                        elif idx_auto and cell.column == idx_auto:  # Identificador de Débito
-                            cell.alignment = Alignment(horizontal="left", vertical="center")
-                        elif idx_protocolo and cell.column == idx_protocolo:  # Nº de Processo
-                            cell.alignment = Alignment(horizontal="left", vertical="center")
-                        elif idx_data_venc and cell.column == idx_data_venc:  # Data de Vencimento
-                            cell.alignment = Alignment(horizontal="center", vertical="center")
-                            cell.number_format = '@'  # Formato texto para manter formato DD/MM/YYYY
-                        elif idx_modal and cell.column == idx_modal:  # Modal
-                            cell.alignment = Alignment(horizontal="left", vertical="center")
-                            cell.number_format = '@'  # Formato texto
-            
-            worksheet.freeze_panes = 'A2'
-        
-        buffer.seek(0)
-        excel_data = buffer.getvalue()
-        return excel_data
-    except Exception as e:
-        buffer.close()
-        raise e
-
-# Main: carregar as duas bases
+# Carrega as duas bases antes de liberar a comparação.
 df_antiga = None
 df_nova = None
 if arquivo_antiga:
     with st.spinner("Carregando base antiga..."):
-        df_antiga = carregar_dados(arquivo_antiga)
+        df_antiga = carregar_dados_vencimentos(arquivo_antiga)
 if arquivo_nova:
     with st.spinner("Carregando base nova..."):
-        df_nova = carregar_dados(arquivo_nova)
+        df_nova = carregar_dados_vencimentos(arquivo_nova)
 
 if df_antiga is not None and df_nova is not None:
     st.markdown("---")
@@ -438,7 +156,7 @@ if df_antiga is not None and df_nova is not None:
         st.caption(f"Total: {len(df_nova):,} registros")
     st.markdown("---")
 
-    # Verificar colunas obrigatórias em ambas
+    # Se a coluna obrigatória não existir, o app para por aqui.
     ok_antiga = coluna_auto in df_antiga.columns and coluna_vencimento in df_antiga.columns
     ok_nova = coluna_auto in df_nova.columns and coluna_vencimento in df_nova.columns
     if not ok_antiga:
@@ -464,7 +182,7 @@ if df_antiga is not None and df_nova is not None:
                 except Exception as e:
                     st.error(f"Erro ao comparar: {str(e)}")
 
-# Exibir resultados da comparação
+# Exibe o resultado salvo em sessão.
 if 'comparacao_resultado' in st.session_state:
     res = st.session_state['comparacao_resultado']
     comparacao_df = res['comparacao_df']
@@ -490,7 +208,7 @@ if 'comparacao_resultado' in st.session_state:
             f"Base nova: {res.get('duplicados_nova', 0):,} duplicados removidos (mantida a data de vencimento mais antiga por auto)."
         )
 
-    # Métricas resumidas
+    # Resumo rápido para o usuário bater o olho.
     total_sairam = comparacao_df['Sairam'].sum()
     total_entraram = comparacao_df['Entraram'].sum()
     col1, col2, col3, col4 = st.columns(4)
@@ -503,11 +221,11 @@ if 'comparacao_resultado' in st.session_state:
     with col4:
         st.metric("Sairam (total)", f"{total_sairam:,}", f"Entraram: {total_entraram:,}")
 
-    # Tabela de comparação por ano
+    # Tabela base da comparação.
     st.markdown("### 📋 Comparação por ano de vencimento")
     st.dataframe(comparacao_df, use_container_width=True, hide_index=True)
 
-    # Gráficos: barras antiga vs nova; barras saíram x entraram
+    # Os dois gráficos principais da tela.
     st.markdown("### 📈 Gráficos")
     col_a, col_b = st.columns(2)
     with col_a:
@@ -523,18 +241,18 @@ if 'comparacao_resultado' in st.session_state:
         fig_mov.update_layout(barmode='group', title='Sairam x Entraram por ano', height=400)
         st.plotly_chart(fig_mov, use_container_width=True)
 
-    # Exportação: planilha de comparação + listas por ano (autos que saíram / que entraram)
+    # Prepara o material que vai para download e para o histórico.
     st.markdown("---")
     st.markdown("### 📥 Exportar")
     data_arquivo = datetime.now().strftime('%d %m %Y %H%M')
 
-    # Bytes da tabela de comparação
+    # A tabela principal vai em um arquivo próprio.
     buf_comp = io.BytesIO()
     comparacao_df.to_excel(buf_comp, index=False, sheet_name='Comparacao')
     buf_comp.seek(0)
     excel_comparacao_bytes = buf_comp.getvalue()
 
-    # Montar dict de Excel por ano (para download e para salvar no histórico)
+    # Também separa os arquivos por ano porque essa costuma ser a consulta mais comum.
     excel_por_ano_dict = {}
     for ano in sorted(anos_todos, reverse=False):
         df_ano = stats_nova_por_ano[ano]['dataframe'].copy()
@@ -563,7 +281,7 @@ if 'comparacao_resultado' in st.session_state:
         dados_exportacao = dados_exportacao.dropna(how='all')
         if not dados_exportacao.empty:
             try:
-                excel_por_ano_dict[ano] = gerar_excel_formatado(
+                excel_por_ano_dict[ano] = gerar_excel_vencimentos_formatado(
                     dados_exportacao,
                     f'Autos_{ano}',
                     f'Autos Vencimento {ano}.xlsx'
@@ -571,7 +289,7 @@ if 'comparacao_resultado' in st.session_state:
             except Exception:
                 pass
 
-    # Salvar no histórico (SQLite + pasta) na primeira exibição desta comparação
+    # A primeira vez que a comparação aparece na tela, ela já vai para o histórico.
     if st.session_state.get('historico_run_id') is None:
         try:
             config = {
@@ -596,7 +314,7 @@ if 'comparacao_resultado' in st.session_state:
         except Exception as e:
             st.warning(f"Não foi possível salvar no histórico: {e}")
 
-    # Download da tabela de comparação
+    # Download da tabela principal.
     st.download_button(
         label="📥 Download tabela de comparação (Excel)",
         data=excel_comparacao_bytes,
@@ -606,7 +324,7 @@ if 'comparacao_resultado' in st.session_state:
         key="download_comparacao"
     )
 
-    # Exportação por ano de vencimento (base nova)
+    # Download separado por ano usando a base nova.
     st.markdown("#### 📥 Exportar por ano de vencimento (base nova)")
     st.info("💡 Baixe planilhas separadas por ano de vencimento. Cada arquivo contém todos os autos da base nova com vencimento naquele ano (do ano mais antigo ao mais novo).")
     num_colunas_export = min(3, len(anos_todos))
@@ -663,7 +381,7 @@ else:
         - ✅ Histórico de comparações salvo em SQLite + pasta (veja abaixo)
         """)
 
-# --- Histórico de comparações (sempre visível) ---
+# Histórico sempre visível no fim da página.
 st.markdown("---")
 st.markdown("## 📚 Histórico de comparações")
 init_db()
@@ -684,7 +402,7 @@ else:
             st.dataframe(run_full["comparacao_df"], use_container_width=True, hide_index=True)
             col_a, col_b = st.columns(2)
             with col_a:
-                # Download ZIP com todos os arquivos da pasta
+                # Junta tudo da execução em um único ZIP.
                 if run_full.get("arquivos"):
                     buf_zip = io.BytesIO()
                     with zipfile.ZipFile(buf_zip, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -692,7 +410,7 @@ else:
                             if f.is_file():
                                 zf.write(str(f), f.name)
                     buf_zip.seek(0)
-                    # Nome do ZIP = nomes das bases (sem extensão, caracteres seguros)
+                    # O nome do ZIP usa o nome das bases, mas já limpo para Windows.
                     def nome_seguro(s):
                         if not s:
                             return "base"

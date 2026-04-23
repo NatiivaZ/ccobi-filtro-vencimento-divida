@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
-Histórico de comparações: SQLite (metadados + tabela) + pasta com Excel exportados.
+"""Camada de histórico do app.
+
+Guarda os dados principais no SQLite e os arquivos exportados em pasta.
 """
 
 import json
 import sqlite3
 import uuid
+from io import StringIO
 from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
 
-# Caminhos na mesma pasta do app
+# Tudo fica ao lado do app para facilitar backup e uso local.
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "historico_comparacoes.db"
 PASTA_EXPORTACOES = BASE_DIR / "historico_exportacoes"
@@ -19,6 +21,30 @@ PASTA_EXPORTACOES = BASE_DIR / "historico_exportacoes"
 
 def _conectar():
     return sqlite3.connect(str(DB_PATH))
+
+
+def _serializar_json(payload):
+    """Serializa o conteúdo do histórico sem perder acentuação."""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _listar_arquivos_exportados(pasta):
+    """Lista os arquivos de uma execução sempre na mesma ordem."""
+    if pasta and pasta.is_dir():
+        return sorted(pasta.iterdir())
+    return []
+
+
+def _remover_pasta_exportacao(pasta):
+    """Tenta apagar a pasta da execução sem travar a limpeza se algo falhar."""
+    if not (pasta and isinstance(pasta, Path) and pasta.is_dir()):
+        return
+    import shutil
+
+    try:
+        shutil.rmtree(pasta)
+    except Exception:
+        pass
 
 
 def init_db():
@@ -54,10 +80,7 @@ def save_run(
     excel_comparacao_bytes,
     excel_por_ano_dict,
 ):
-    """
-    Salva uma comparação no SQLite e grava os Excel na pasta historico_exportacoes/<id>/.
-    Retorna o id da run.
-    """
+    """Salva a execução atual no banco e grava os arquivos exportados."""
     init_db()
     run_id = uuid.uuid4().hex
     data_hora = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -69,17 +92,17 @@ def save_run(
     total_entraram = int(comparacao_df["Entraram"].sum())
     anos_todos = resultado["anos_todos"]
 
-    config_json = json.dumps(config, ensure_ascii=False)
-    anos_json = json.dumps(anos_todos)
+    config_json = _serializar_json(config)
+    anos_json = _serializar_json(anos_todos)
     comparacao_df_json = comparacao_df.to_json(orient="records", date_format="iso")
 
     pasta_run = PASTA_EXPORTACOES / run_id
     pasta_run.mkdir(parents=True, exist_ok=True)
 
-    # Salvar Excel da tabela de comparação
+    # A comparação principal sempre vai com um nome fixo para ficar fácil de achar.
     (pasta_run / "Comparacao.xlsx").write_bytes(excel_comparacao_bytes)
 
-    # Salvar Excel por ano
+    # Os arquivos por ano ficam separados porque o app também mostra isso assim.
     for ano, bytes_ano in (excel_por_ano_dict or {}).items():
         (pasta_run / f"Autos_vencimento_{ano}.xlsx").write_bytes(bytes_ano)
 
@@ -118,7 +141,7 @@ def save_run(
 
 
 def list_runs():
-    """Lista todas as comparações (mais recente primeiro). Retorna lista de dicts."""
+    """Lista as execuções salvas, da mais recente para a mais antiga."""
     init_db()
     conn = _conectar()
     try:
@@ -149,10 +172,7 @@ def list_runs():
 
 
 def get_run(run_id):
-    """
-    Retorna um dict com: comparacao_df, data_hora, nome_base_antiga, nome_base_nova,
-    config, total_antiga, total_nova, total_sairam, total_entraram, anos_todos, pasta_export, arquivos.
-    """
+    """Recupera uma execução completa pelo id para reabrir no histórico."""
     conn = _conectar()
     try:
         cur = conn.execute(
@@ -169,12 +189,12 @@ def get_run(run_id):
             return None
 
         anos = json.loads(row[8])
-        comparacao_df = pd.read_json(row[9], orient="records")
+        comparacao_df = pd.read_json(StringIO(row[9]), orient="records")
         if "Ano" in comparacao_df.columns:
             comparacao_df["Ano"] = comparacao_df["Ano"].astype(int)
 
         pasta = Path(row[10]) if row[10] else None
-        arquivos = list(pasta.iterdir()) if pasta and pasta.is_dir() else []
+        arquivos = _listar_arquivos_exportados(pasta)
 
         return {
             "id": run_id,
@@ -196,7 +216,7 @@ def get_run(run_id):
 
 
 def excluir_run(run_id):
-    """Remove a run do SQLite e apaga a pasta de exportações (se existir)."""
+    """Exclui a execução e, se der, limpa a pasta que foi criada para ela."""
     run = get_run(run_id)
     if not run:
         return False
@@ -206,11 +226,5 @@ def excluir_run(run_id):
         conn.commit()
     finally:
         conn.close()
-    pasta = run.get("pasta_export")
-    if pasta and isinstance(pasta, Path) and pasta.is_dir():
-        import shutil
-        try:
-            shutil.rmtree(pasta)
-        except Exception:
-            pass
+    _remover_pasta_exportacao(run.get("pasta_export"))
     return True
